@@ -1,0 +1,107 @@
+name: Build and Release
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.21'
+          
+      - name: Check out code
+        uses: actions/checkout@v3
+        
+      - name: Get dependencies
+        run: go mod download
+        
+      - name: Run tests
+        run: go test -v ./...
+        
+      - name: Run race condition tests
+        run: go test -race ./pkg/picalc
+
+  build:
+    name: Build and Release
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.21'
+          
+      - name: Check out code
+        uses: actions/checkout@v3
+        
+      - name: Get dependencies
+        run: go mod download
+        
+      - name: Get version
+        id: get_version
+        run: |
+          VERSION=$(grep -m1 "VERSION =" pkg/picalc/picalc.go | cut -d '"' -f2)
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+        
+      - name: Build
+        run: |
+          # Build for multiple platforms
+          PLATFORMS=("linux/amd64" "linux/arm64" "darwin/amd64" "darwin/arm64" "windows/amd64")
+          
+          mkdir -p dist
+          
+          for PLATFORM in "${PLATFORMS[@]}"; do
+            OS=${PLATFORM%/*}
+            ARCH=${PLATFORM#*/}
+            
+            echo "Building for $OS/$ARCH..."
+            FILENAME="picalc"
+            if [ "$OS" = "windows" ]; then
+              FILENAME="picalc.exe"
+            fi
+            
+            GOOS=$OS GOARCH=$ARCH go build -o "dist/$FILENAME" ./cmd/picalc
+            
+            # Create archive
+            if [ "$OS" = "windows" ]; then
+              (cd dist && zip -r "picalc_${{ steps.get_version.outputs.version }}_${OS}_${ARCH}.zip" "$FILENAME")
+            else
+              tar -czf "dist/picalc_${{ steps.get_version.outputs.version }}_${OS}_${ARCH}.tar.gz" -C dist "$FILENAME"
+            fi
+            
+            # Clean up binary
+            rm "dist/$FILENAME"
+          done
+          
+      - name: Create Release
+        id: create_release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: "v${{ steps.get_version.outputs.version }}"
+          name: "Release v${{ steps.get_version.outputs.version }}"
+          draft: false
+          prerelease: false
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/picalc:latest
+            ghcr.io/${{ github.repository_owner }}/picalc:${{ steps.get_version.outputs.version }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
