@@ -2,9 +2,9 @@ package picalc
 
 import (
 	"fmt"
+	"math"
 	"math/big"
 	"os"
-	"runtime"
 	"sync"
 	"sync/atomic"
 )
@@ -33,9 +33,9 @@ func NewPi(precision int64) *Pi {
 func CalculatePi(precision int64, pi *Pi) {
 	// For very small precisions, use hardcoded values
 	if precision <= 10 {
-		hardcodedPi := []int{3, 1, 4, 1, 5, 9, 2, 6, 5, 3, 5}
+		hardcodedPi := []int{3, 1, 4, 1, 5, 9, 2, 6, 5, 3}
 		pi.mutex.Lock()
-		for i := 0; i <= int(precision) && i < len(hardcodedPi); i++ {
+		for i := 0; i < len(hardcodedPi) && i < len(pi.digits); i++ {
 			pi.digits[i] = hardcodedPi[i]
 		}
 		pi.mutex.Unlock()
@@ -43,205 +43,180 @@ func CalculatePi(precision int64, pi *Pi) {
 		return
 	}
 
-	// Use a more efficient direct algorithm with sufficient decimal places
-	computePiChudnovsky(precision, pi)
-}
+	// Calculate Pi using fixed precision algorithm
+	decimalStr := calculatePiChudnovsky(precision)
 
-// computePiChudnovsky implements the Chudnovsky algorithm for calculating Pi
-func computePiChudnovsky(precision int64, pi *Pi) {
-	// Constants from the Chudnovsky formula
-	a := big.NewInt(13591409)
-	c := big.NewInt(640320)
-
-	// Calculate number of terms needed (each term gives ~14 digits)
-	terms := precision / 14
-	if terms < 1 {
-		terms = 1
-	}
-
-	// Setup big number calculations with extra precision
-	// Need extra precision to avoid rounding errors
-	digits := precision + 20
-
-	// Use the Binary Splitting algorithm for the series calculation
-	pqt := binarySplitMultiThread(0, terms, pi)
-
-	// Calculate C * sqrt(10005)
-	c3 := new(big.Int).Mul(c, c)
-	c3.Mul(c3, c)
-
-	// C = 426880 * sqrt(10005)
-	cc := new(big.Int).SetInt64(10005)
-	cc.Mul(big.NewInt(426880), bigSqrt(cc, digits))
-
-	// Final Pi value: C * sqrt(10005) / (a + b*sum)
-	// where sum is R/Q from binary splitting
-	num := new(big.Int).Mul(a, pqt.q)
-	num.Add(num, pqt.r)
-
-	// Scale for decimal precision
-	scaledC := new(big.Int).Mul(cc, pow10(digits))
-
-	// Pi = C / sum
-	piVal := new(big.Int).Div(scaledC, num)
-	piStr := piVal.String()
-
-	// Set the digits
+	// Extract the digits
 	pi.mutex.Lock()
 	// First digit is 3
 	pi.digits[0] = 3
 
-	// Extract decimal digits
-	for i := 1; i <= int(precision) && i < len(pi.digits); i++ {
-		if i-1 < len(piStr) {
-			pi.digits[i] = int(piStr[i-1] - '0')
-		} else {
-			pi.digits[i] = 0
+	// Extract the decimal part (skip the "3." at the beginning)
+	start := 2 // Skip "3."
+	for i := 1; i <= int(precision) && i < len(pi.digits) && start < len(decimalStr); i++ {
+		if decimalStr[start] >= '0' && decimalStr[start] <= '9' {
+			pi.digits[i] = int(decimalStr[start] - '0')
 		}
+		start++
 	}
 	pi.mutex.Unlock()
+
+	// Mark as completed
+	pi.computed.Store(pi.precision)
 }
 
-// PQT values for binary splitting
-type pqt struct {
-	p, q, r *big.Int
-}
+// calculatePiChudnovsky calculates pi to specified precision using Chudnovsky algorithm
+func calculatePiChudnovsky(precision int64) string {
+	// Calculate number of terms needed (each term gives ~14.18 digits)
+	terms := int64(float64(precision)/14.18) + 2
 
-// binarySplitMultiThread performs binary splitting with multiple threads
-func binarySplitMultiThread(a, b int64, pi *Pi) pqt {
-	// For small ranges or on single processors, use single-threaded version
-	if b-a < 100 || runtime.NumCPU() < 2 {
-		return binarySplit(a, b)
+	// Set up constants for Chudnovsky algorithm
+	A := big.NewInt(13591409)
+	B := big.NewInt(545140134)
+	C3_24 := big.NewInt(640320 * 640320 * 640320 / 24)
+
+	// Set precision for big.Float operations
+	floatPrec := uint(int(math.Ceil(math.Log2(10)*float64(precision))) + 100)
+
+	// Use binary splitting to calculate the sum
+	// P, Q, R are as defined in the Chudnovsky paper
+	var Q, R *big.Int
+
+	// For small calculations, use direct approach
+	if precision < 100 {
+		_, Q, R = binarySplitSerial(0, terms, A, B, C3_24)
+	} else {
+		// For larger calculations, use parallel approach
+		_, Q, R = binarySplitParallel(0, terms, A, B, C3_24)
 	}
 
-	// Divide the work
-	mid := (a + b) / 2
+	// Final calculation Pi = (426880 * sqrt(10005)) / (R/Q)
+	// Convert to big.Float for division and square root
+	sqrtArg := new(big.Float).SetPrec(floatPrec)
+	sqrtArg.SetInt64(10005)
 
-	// Create channel for results
-	resultChan := make(chan pqt, 2)
+	sqrt10005 := new(big.Float).SetPrec(floatPrec)
+	sqrt10005.Sqrt(sqrtArg)
 
-	// Calculate first half in a separate goroutine
-	go func() {
-		resultChan <- binarySplit(a, mid)
-	}()
+	C := new(big.Float).SetPrec(floatPrec)
+	C.SetInt64(426880)
+	C.Mul(C, sqrt10005)
 
-	// Calculate second half in current goroutine
-	right := binarySplit(mid, b)
+	// R/Q
+	sum := new(big.Float).SetPrec(floatPrec)
+	sumQ := new(big.Float).SetPrec(floatPrec)
+	sumQ.SetInt(Q)
 
-	// Get result from first half
-	left := <-resultChan
+	sumR := new(big.Float).SetPrec(floatPrec)
+	sumR.SetInt(R)
+
+	sum.Quo(sumR, sumQ)
+
+	// Pi = C / sum
+	pi := new(big.Float).SetPrec(floatPrec)
+	pi.Quo(C, sum)
+
+	// Return as string with enough precision
+	return pi.Text('f', int(precision)+10)
+}
+
+// binarySplitSerial computes the Chudnovsky series using binary splitting (serial version)
+func binarySplitSerial(a, b int64, A, B, C3_24 *big.Int) (*big.Int, *big.Int, *big.Int) {
+	// Base case: compute a single term
+	if b-a == 1 {
+		var P, Q, R *big.Int
+
+		if a == 0 {
+			// First term
+			P = big.NewInt(1)
+			Q = big.NewInt(1)
+			R = new(big.Int).Set(A) // 13591409
+		} else {
+			// P(a) = (6a-5)(2a-1)(6a-1)
+			P = big.NewInt(6*a - 5)
+			P = P.Mul(P, big.NewInt(2*a-1))
+			P = P.Mul(P, big.NewInt(6*a-1))
+
+			// Q(a) = a^3 * C3_24
+			Q = big.NewInt(a)
+			Q = Q.Mul(Q, big.NewInt(a))
+			Q = Q.Mul(Q, big.NewInt(a))
+			Q = Q.Mul(Q, C3_24)
+
+			// R(a) = P(a) * (A + B*a)
+			term := new(big.Int).Mul(B, big.NewInt(a))
+			term = term.Add(term, A)
+			R = new(big.Int).Mul(P, term)
+
+			// Alternate sign: (-1)^a
+			if a%2 == 1 {
+				R = R.Neg(R)
+			}
+		}
+
+		return P, Q, R
+	}
+
+	// Recursive case: split the range
+	m := (a + b) / 2
+	P1, Q1, R1 := binarySplitSerial(a, m, A, B, C3_24)
+	P2, Q2, R2 := binarySplitSerial(m, b, A, B, C3_24)
 
 	// Combine the results
-	result := combinePQT(left, right)
-
-	// Update progress
-	compRange := b - a
-	pi.computed.Add(compRange)
-
-	return result
-}
-
-// binarySplit implements the binary splitting algorithm for Chudnovsky formula
-func binarySplit(a, b int64) pqt {
-	// Base case: single term
-	if a+1 == b {
-		// P(a,a+1) = (6a-5)*(2a-1)*(6a-1)
-		p := big.NewInt(6*a - 5)
-		p.Mul(p, big.NewInt(2*a-1))
-		p.Mul(p, big.NewInt(6*a-1))
-
-		// Q(a,a+1) = (10939058860032000) * a^3
-		q := big.NewInt(a)
-		q.Mul(q, big.NewInt(a))
-		q.Mul(q, big.NewInt(a))
-		q.Mul(q, big.NewInt(10939058860032000)) // 640320^3/24
-
-		// R(a,a+1) = P(a,a+1) * (13591409 + 545140134*a)
-		r := big.NewInt(545140134)
-		r.Mul(r, big.NewInt(a))
-		r.Add(r, big.NewInt(13591409))
-		r.Mul(r, p)
-
-		// Apply (-1)^k factor
-		if a&1 == 1 { // If a is odd
-			r.Neg(r)
-		}
-
-		return pqt{p: p, q: q, r: r}
-	}
-
-	// Recursive case
-	mid := (a + b) / 2
-	left := binarySplit(a, mid)
-	right := binarySplit(mid, b)
-
-	return combinePQT(left, right)
-}
-
-// combinePQT combines two PQT values according to binary splitting rules
-func combinePQT(left, right pqt) pqt {
 	// P = P1 * P2
-	p := new(big.Int).Mul(left.p, right.p)
+	P := new(big.Int).Mul(P1, P2)
 
 	// Q = Q1 * Q2
-	q := new(big.Int).Mul(left.q, right.q)
+	Q := new(big.Int).Mul(Q1, Q2)
 
-	// R = Q2 * R1 + P1 * R2
-	tmp1 := new(big.Int).Mul(right.q, left.r)
-	tmp2 := new(big.Int).Mul(left.p, right.r)
-	r := new(big.Int).Add(tmp1, tmp2)
+	// R = R1 * Q2 + P1 * R2
+	R1Q2 := new(big.Int).Mul(R1, Q2)
+	P1R2 := new(big.Int).Mul(P1, R2)
+	R := new(big.Int).Add(R1Q2, P1R2)
 
-	return pqt{p: p, q: q, r: r}
+	return P, Q, R
 }
 
-// bigSqrt calculates square root using big integers with sufficient precision
-func bigSqrt(n *big.Int, prec int64) *big.Int {
-	// Handle small values directly
-	if n.Cmp(big.NewInt(1000000)) < 0 {
-		// Use the built-in Sqrt for small values
-		return new(big.Int).Sqrt(n)
+// binarySplitParallel computes the Chudnovsky series using binary splitting (parallel version)
+func binarySplitParallel(a, b int64, A, B, C3_24 *big.Int) (*big.Int, *big.Int, *big.Int) {
+	// For small ranges, use serial version
+	if b-a <= 100 {
+		return binarySplitSerial(a, b, A, B, C3_24)
 	}
 
-	// Initial approximation
-	x := new(big.Int).Rsh(n, 1) // x = n/2
-	if x.Sign() == 0 {
-		x.SetInt64(1)
-	}
+	// Split the range
+	m := (a + b) / 2
 
-	// Temporary variables
-	t := new(big.Int)
+	// Use goroutines for parallel computation
+	var P1, Q1, R1, P2, Q2, R2 *big.Int
+	var wg sync.WaitGroup
 
-	// Newton's method: x = (x + n/x) / 2
-	for i := 0; i < 100; i++ {
-		// t = n/x
-		t.Div(n, x)
+	// Calculate left half in parallel
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		P1, Q1, R1 = binarySplitParallel(a, m, A, B, C3_24)
+	}()
 
-		// t = x + n/x
-		t.Add(t, x)
+	// Calculate right half in this goroutine
+	P2, Q2, R2 = binarySplitParallel(m, b, A, B, C3_24)
 
-		// t = (x + n/x) / 2
-		t.Rsh(t, 1)
+	// Wait for left half to complete
+	wg.Wait()
 
-		// Check for convergence
-		if t.Cmp(x) == 0 {
-			break
-		}
+	// Combine the results
+	// P = P1 * P2
+	P := new(big.Int).Mul(P1, P2)
 
-		x, t = t, x
-	}
+	// Q = Q1 * Q2
+	Q := new(big.Int).Mul(Q1, Q2)
 
-	return x
-}
+	// R = R1 * Q2 + P1 * R2
+	R1Q2 := new(big.Int).Mul(R1, Q2)
+	P1R2 := new(big.Int).Mul(P1, R2)
+	R := new(big.Int).Add(R1Q2, P1R2)
 
-// pow10 returns 10^n as a big.Int
-func pow10(n int64) *big.Int {
-	result := big.NewInt(1)
-	if n <= 0 {
-		return result
-	}
-
-	ten := big.NewInt(10)
-	return result.Exp(ten, big.NewInt(n), nil)
+	return P, Q, R
 }
 
 // GetDigits returns the first n decimal digits of Pi
